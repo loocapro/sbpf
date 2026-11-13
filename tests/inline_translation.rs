@@ -2,7 +2,7 @@
 //!
 //! Every access lands on or next to a region boundary, a stack frame gap, a read-only region
 //! or an unmapped region index, in the aligned memory mapping used by Agave.
-#![cfg(all(feature = "dev-context-only-utils", target_arch = "x86_64"))]
+#![cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
 
 use solana_sbpf::{
     assembler::assemble,
