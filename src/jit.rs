@@ -29,7 +29,7 @@ use crate::{
     ebpf::{self, FIRST_SCRATCH_REG, FRAME_PTR_REG, INSN_SIZE, SCRATCH_REGS},
     elf::Executable,
     error::{EbpfError, ProgramResult},
-    memory_region::MemoryMapping,
+    memory_region::{JitRegionTable, MemoryMapping, MemoryRegion},
     program::{BuiltinFunction, JitProgram, UnsealedJitProgram},
     vm::{get_runtime_environment_key, Config, ContextObject, EbpfVm, RuntimeEnvironmentSlot},
     x86::{
@@ -40,7 +40,7 @@ use crate::{
 };
 
 /// The maximum machine code length in bytes of a program with no guest instructions
-pub const MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH: usize = 4096;
+pub const MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH: usize = 8192;
 /// The maximum machine code length in bytes of a single guest instruction
 pub const MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION: usize = 110;
 /// The maximum machine code length in bytes of an instruction meter checkpoint
@@ -153,7 +153,9 @@ const ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE: usize = 13;
 const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 14;
 const ANCHOR_FIRST_ATTEMPT_SUCCESS: usize = 15;
 const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 23;
-const ANCHOR_COUNT: usize = 35; // Update me when adding or removing anchors
+const ANCHOR_TRANSLATE_FALLBACK: usize = 35;
+const ANCHOR_TRANSLATE_INLINE: usize = 47;
+const ANCHOR_COUNT: usize = 59; // Update me when adding or removing anchors
 
 /// Mapping of guest to host registers
 pub const REGISTER_MAP: [X86Register; 11] = [
@@ -1219,7 +1221,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             Some(Value::Constant64(_constant, _user_provided)) => 8,
             _ => 0,
         };
-        let anchor = ANCHOR_TRANSLATE_MEMORY_ADDRESS + anchor_base + len.trailing_zeros() as usize;
+        let anchor = ANCHOR_TRANSLATE_INLINE + anchor_base + len.trailing_zeros() as usize;
         // store self.pc in the first stack slot of the anchor
         self.emit_ins(X86Instruction::store_immediate(OperandSize::S64, RSP, X86IndirectAccess::OffsetIndexShift(-16, RSP, 0), self.pc as i64));
         self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(anchor, 5)));
@@ -1698,6 +1700,133 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, REGISTER_SCRATCH, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult) + std::mem::size_of::<u64>() as i32)));
             }
 
+            self.emit_ins(X86Instruction::return_near());
+        }
+
+        self.emit_inline_address_translation();
+    }
+
+    /// Emits a conditional jump whose destination is patched later by `patch_forward_jump`
+    fn emit_forward_jump(&mut self, opcode: u8) -> usize {
+        // Taken before emitting, as `emit_ins` may append a diversification noop
+        let jump_end = self.offset_in_text_section + 6;
+        self.emit_ins(X86Instruction::conditional_jump_immediate(opcode, 0));
+        jump_end
+    }
+
+    /// Points the jump emitted by `emit_forward_jump` at the current position
+    fn patch_forward_jump(&mut self, jump_end: usize) {
+        let relative = (self.offset_in_text_section - jump_end) as i32;
+        unsafe {
+            let ptr = self.result.text_section_mut().as_mut_ptr().add(jump_end - 4);
+            ptr::write_unaligned(ptr.cast::<i32>(), relative);
+        }
+    }
+
+    /// Translates vm addresses inline for initialized aligned memory mappings.
+    ///
+    /// The call sites of `emit_address_translation` enter here with the same stack layout as
+    /// `ANCHOR_TRANSLATE_MEMORY_ADDRESS`. Every condition checked by
+    /// `MemoryMapping::load_first_attempt` / `store_first_attempt` is replicated; whenever one
+    /// does not hold the generic path is taken, so error reporting is unchanged.
+    fn emit_inline_address_translation(&mut self) {
+        let lower_key = self.immediate_value_key as i32 as i64;
+        let virtual_address_bits = self.config.aligned_region_size.trailing_zeros() as i64;
+        let stack_gap_shift = if self.config.stack_frame_size.is_power_of_two() {
+            self.config.stack_frame_size.trailing_zeros() as i64
+        } else {
+            63
+        };
+        let anchors: [(usize, i32); 12] = [
+            (0, 1), (0, 2), (0, 4), (0, 8),
+            (4, 1), (4, 2), (4, 4), (4, 8),
+            (8, 1), (8, 2), (8, 4), (8, 8),
+        ];
+
+        // Fallback trampolines: undo the inline prologue and continue with the generic path
+        for (anchor_base, len) in anchors {
+            let target_offset = anchor_base + len.trailing_zeros() as usize;
+            self.set_anchor(ANCHOR_TRANSLATE_FALLBACK + target_offset);
+            self.emit_ins(X86Instruction::pop(RCX));
+            self.emit_ins(X86Instruction::pop(RDX));
+            self.emit_ins(X86Instruction::pop(RAX));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 24, None)); // RSP += 24
+            self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_TRANSLATE_MEMORY_ADDRESS + target_offset, 5)));
+        }
+
+        for (anchor_base, len) in anchors {
+            let target_offset = anchor_base + len.trailing_zeros() as usize;
+            let fallback = ANCHOR_TRANSLATE_FALLBACK + target_offset;
+            self.set_anchor(ANCHOR_TRANSLATE_INLINE + target_offset);
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3B, REGISTER_INSTRUCTION_METER, RSP, Some(X86IndirectAccess::OffsetIndexShift(-8, RSP, 0)))); // cmp REGISTER_INSTRUCTION_METER, pc (on rsp);
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x86, self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 6)));
+            // skip over the two slots pushed by the caller, we'll pop them before returning
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, RSP, 24, None)); // RSP -= 24
+            self.emit_ins(X86Instruction::push(RAX, None));
+            self.emit_ins(X86Instruction::push(RDX, None));
+            self.emit_ins(X86Instruction::push(RCX, None));
+            // RAX = &MemoryMapping, whose first field is the JitRegionTable
+            self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, RAX, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping))));
+            self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, RAX, virtual_address_bits, Some(X86IndirectAccess::Offset(JitRegionTable::SHIFT_OFFSET))));
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(fallback, 6))); // jne: inline path disabled
+            // RDX = region index = vm_addr >> virtual_address_bits
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RDX));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, RDX, virtual_address_bits, None));
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3B, RDX, RAX, Some(X86IndirectAccess::Offset(JitRegionTable::LEN_OFFSET)))); // cmp RDX, table.len
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x83, self.relative_to_anchor(fallback, 6))); // jae: no such region
+            // RAX = &regions[RDX]
+            self.emit_ins(X86Instruction::load(OperandSize::S64, RAX, RAX, X86IndirectAccess::Offset(JitRegionTable::REGIONS_OFFSET)));
+            self.emit_ins(X86Instruction::lea(OperandSize::S64, RDX, RDX, Some(X86IndirectAccess::OffsetIndexShift(0, RDX, 2)))); // RDX *= 5
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, RDX, 3, None)); // RDX <<= 3
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RDX, RAX, None)); // RAX += RDX
+            // RDX = vm_addr - region.vm_addr
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RDX));
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2B, RDX, RAX, Some(X86IndirectAccess::Offset(MemoryRegion::JIT_VM_ADDR_OFFSET)))); // sub RDX, region.vm_addr
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x82, self.relative_to_anchor(fallback, 6))); // jb: below the region
+            // Gapped regions: only the stack frame gap size is handled inline
+            self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S8, RAX, 63, Some(X86IndirectAccess::Offset(MemoryRegion::JIT_GAP_SHIFT_OFFSET))));
+            let continuous_region = self.emit_forward_jump(0x84); // je
+            self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S8, RAX, stack_gap_shift, Some(X86IndirectAccess::Offset(MemoryRegion::JIT_GAP_SHIFT_OFFSET))));
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(fallback, 6))); // jne: unexpected gap size
+            self.emit_ins(X86Instruction::test_immediate(OperandSize::S64, RDX, 1i64 << stack_gap_shift, None));
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(fallback, 6))); // jnz: inside a gap
+            // RDX -= (RDX >> gap_shift) << (gap_shift - 1), which removes the gaps below the offset
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, RDX, RCX));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, RCX, stack_gap_shift, None));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, RCX, stack_gap_shift - 1, None));
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, RCX, RDX, None)); // RDX -= RCX
+            self.patch_forward_jump(continuous_region);
+            // Bounds check: offset + len <= host length
+            self.emit_ins(X86Instruction::lea(OperandSize::S64, RDX, RCX, Some(X86IndirectAccess::Offset(len))));
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3B, RCX, RAX, Some(X86IndirectAccess::Offset(MemoryRegion::JIT_HOST_LEN_OFFSET)))); // cmp RCX, host.len
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x87, self.relative_to_anchor(fallback, 6))); // ja: out of bounds
+            if anchor_base != 0 {
+                // Stores need a mutable host buffer
+                self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, RAX, 1, Some(X86IndirectAccess::Offset(MemoryRegion::JIT_HOST_TAG_OFFSET))));
+                self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(fallback, 6))); // jne: read-only
+            }
+            // RDX = host address
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x03, RDX, RAX, Some(X86IndirectAccess::Offset(MemoryRegion::JIT_HOST_PTR_OFFSET)))); // add RDX, host.ptr
+            let size = match len {
+                1 => OperandSize::S8,
+                2 => OperandSize::S16,
+                4 => OperandSize::S32,
+                _ => OperandSize::S64,
+            };
+            if anchor_base == 0 { // AccessType::Load
+                self.emit_ins(X86Instruction::load(size, RDX, REGISTER_SCRATCH, X86IndirectAccess::Offset(0)));
+            } else { // AccessType::Store
+                self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, RCX, X86IndirectAccess::OffsetIndexShift(32, RSP, 0))); // RCX = value to store
+                if anchor_base == 8 {
+                    // Second half of emit_sanitized_load_immediate(stack_slot_of_value_to_store, constant)
+                    self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RCX, lower_key, None));
+                }
+                self.emit_ins(X86Instruction::store(size, RCX, RDX, X86IndirectAccess::Offset(0)));
+            }
+            self.emit_ins(X86Instruction::pop(RCX));
+            self.emit_ins(X86Instruction::pop(RDX));
+            self.emit_ins(X86Instruction::pop(RAX));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 24, None)); // RSP += 24
             self.emit_ins(X86Instruction::return_near());
         }
     }
