@@ -8,7 +8,13 @@ use crate::{
     vm::{Config, ContextObject, EncryptedHostAddressToEbpfVm},
 };
 use std::fmt::Formatter;
-use std::{array, cell::UnsafeCell, fmt, mem, ops::Range, ptr};
+use std::{
+    array,
+    cell::{Cell, UnsafeCell},
+    fmt, mem,
+    ops::Range,
+    ptr,
+};
 
 /* Explanation of the Gapped Memory
 
@@ -257,6 +263,8 @@ pub struct MemoryRegion {
     vm_gap_shift: u8,
     /// User defined payload for the [AccessViolationHandler]
     pub access_violation_handler_payload: Option<u16>,
+    /// End of the highest host range written through this region, see [`Self::store_watermark`]
+    store_watermark: Cell<u64>,
 }
 
 impl MemoryRegion {
@@ -276,7 +284,27 @@ impl MemoryRegion {
             vm_addr,
             vm_gap_shift,
             access_violation_handler_payload: None,
+            store_watermark: Cell::new(0),
         }
+    }
+
+    /// Host offset below which all stores through this region so far have landed.
+    ///
+    /// Lets a host that recycles the buffer zero only the prefix the guest could have dirtied.
+    pub fn store_watermark(&self) -> u64 {
+        self.store_watermark.get()
+    }
+
+    #[inline(always)]
+    fn note_access(&self, access_type: AccessType, host_buffer: &HostBuffer, len: u64) {
+        if access_type != AccessType::Store {
+            return;
+        }
+        let start = (host_buffer.ptr().cast::<u8>() as u64)
+            .wrapping_sub(self.host.ptr().cast::<u8>() as u64);
+        let end = start.saturating_add(len);
+        self.store_watermark
+            .set(self.store_watermark.get().max(end));
     }
 
     /// Creates a new, empty `MemoryRegion`.
@@ -844,7 +872,9 @@ impl MemoryMapping {
             Some(region)
                 if region.host_buffer().is_mutable() || access_type != AccessType::Store =>
             {
-                region.vm_to_host_buffer(vm_addr, len)
+                region
+                    .vm_to_host_buffer(vm_addr, len)
+                    .inspect(|host_buffer| region.note_access(access_type, host_buffer, len))
             }
             _ => None,
         }
@@ -1082,6 +1112,7 @@ fn invoke_access_violation_handler_then_map<C: ContextObject>(
     let memory_mapping = unsafe { context_object.active_mapping_ptr().as_mut() };
     if region.host_buffer().is_mutable() || access_type != AccessType::Store {
         if let Some(host_buffer) = region.vm_to_host_buffer(vm_addr, len) {
+            region.note_access(access_type, &host_buffer, len);
             if let Err(err) = unsafe { memory_mapping.replace_region(region_index, region) } {
                 return StableResult::Err(err);
             }
@@ -1181,6 +1212,41 @@ mod test {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
+
+    #[test]
+    fn test_store_watermark() {
+        let mut mem = [0u8; 3 * 4096];
+        let readonly = [0u8; 64];
+        let config = Config {
+            aligned_memory_mapping: true,
+            ..Config::default()
+        };
+        let m = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw const readonly, MM_REGION_SIZE),
+                    MemoryRegion::new_gapped(&raw mut mem, 2 * MM_REGION_SIZE, 4096),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        let watermark = |region: usize| m.get_regions()[region].store_watermark();
+        m.map(AccessType::Load, 2 * MM_REGION_SIZE + 100, 8)
+            .unwrap();
+        assert_eq!(watermark(2), 0);
+        m.map(AccessType::Store, 2 * MM_REGION_SIZE + 100, 8)
+            .unwrap();
+        m.map(AccessType::Store, 2 * MM_REGION_SIZE + 8, 4).unwrap();
+        assert_eq!(watermark(2), 108);
+        // vm offset 2 * 4096 + 8 lands at host offset 4096 + 8 (one gap removed)
+        m.map(AccessType::Store, 2 * MM_REGION_SIZE + 2 * 4096 + 8, 8)
+            .unwrap();
+        assert_eq!(watermark(2), 4096 + 16);
+        assert!(m.map(AccessType::Store, MM_REGION_SIZE + 8, 8).is_err());
+        assert_eq!(watermark(1), 0);
+    }
 
     #[test]
     fn test_mapping_cache() {
