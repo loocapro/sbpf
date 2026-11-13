@@ -23,7 +23,7 @@ fn run_both(source: &str, sbpf_version: SBPFVersion) -> (String, String) {
         ..Config::default()
     };
     let loader = Arc::new(BuiltinProgram::new_loader(config));
-    let mut executable = assemble::<TestContextObject>(source, loader).unwrap();
+    let executable = assemble::<TestContextObject>(source, loader).unwrap();
     let describe = |outcome: &ExecutionOutcome, mem: &[u8; INPUT_LEN]| {
         format!(
             "{:?} count={} pc={} mem={:?}",
@@ -73,18 +73,11 @@ const OPS: [(&str, i64); 12] = [
     ("stxdw [r1{off}], r2", 8),
 ];
 
-fn program(base_region: i64, base_offset: i64, op: &str, offset: i64) -> String {
-    let off = if offset < 0 {
-        format!("-{}", -offset)
-    } else {
-        format!("+{offset}")
-    };
-    let op = op.replace("{off}", &off);
+fn program(r1_setup: &str, op: &str, offset: i64) -> String {
+    let op = op.replace("{off}", &format!("{offset:+}"));
     format!(
         "
-        mov64 r1, {base_region}
-        lsh64 r1, 32
-        add64 r1, {base_offset}
+        {r1_setup}
         mov64 r2, 0x11223344
         lsh64 r2, 32
         or64 r2, 0x55667788
@@ -93,16 +86,31 @@ fn program(base_region: i64, base_offset: i64, op: &str, offset: i64) -> String 
     )
 }
 
+fn region(base_region: i64, base_offset: i64) -> String {
+    format!("mov64 r1, {base_region}\n lsh64 r1, 32\n add64 r1, {base_offset}")
+}
+
 #[test]
 fn test_input_region_boundaries() {
     let len = INPUT_LEN as i64;
     for (op, size) in OPS {
-        for offset in [0, 1, len - size, len - size + 1, len - 1, len, -1, -8, 4096, -4096] {
-            assert_same(&program(4, 0, op, offset));
+        for offset in [
+            0,
+            1,
+            len - size,
+            len - size + 1,
+            len - 1,
+            len,
+            -1,
+            -8,
+            4096,
+            -4096,
+        ] {
+            assert_same(&program(&region(4, 0), op, offset));
         }
         // The same accesses with the offset folded into the base register
         for offset in [0, len - size, len - size + 1, -1] {
-            assert_same(&program(4, offset, op, 0));
+            assert_same(&program(&region(4, offset), op, 0));
         }
     }
 }
@@ -113,8 +121,8 @@ fn test_unmapped_and_readonly_regions() {
         // Index 0: the program's read-only region, index 1: empty bytecode slot,
         // index 3: the heap, index 5 and beyond: no region at all
         for base_region in [0, 1, 3, 5, 6, 255, 0x7FFF_FFFF, -1] {
-            assert_same(&program(base_region, 0, op, 0));
-            assert_same(&program(base_region, 0, op, -1));
+            assert_same(&program(&region(base_region, 0), op, 0));
+            assert_same(&program(&region(base_region, 0), op, -1));
         }
     }
 }
@@ -143,18 +151,11 @@ fn test_stack_frame_gaps() {
             -(64 * 2 * frame),
         ] {
             // Large offsets do not fit the 16 bit offset field, so they go through the base register
-            let source = format!(
-                "
-                mov64 r1, r10
-                add64 r1, {offset}
-                mov64 r2, 0x11223344
-                lsh64 r2, 32
-                or64 r2, 0x55667788
-                {}
-                exit",
-                op.replace("{off}", "+0")
-            );
-            assert_same(&source);
+            assert_same(&program(
+                &format!("mov64 r1, r10\n add64 r1, {offset}"),
+                op,
+                0,
+            ));
         }
     }
 }
@@ -163,11 +164,7 @@ fn test_stack_frame_gaps() {
 fn test_stack_gaps_inside_calls() {
     // The callee frame sits one frame and one gap above the caller in V0
     for offset in [-8, 0, 8, 4088, 4096, 8184, 8192, -4096, -4104] {
-        let off = if offset < 0 {
-            format!("-{}", -offset)
-        } else {
-            format!("+{offset}")
-        };
+        let off = format!("{offset:+}");
         let source = format!(
             "
             stdw [r10-8], 7

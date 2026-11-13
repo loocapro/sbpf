@@ -265,20 +265,25 @@ pub struct MemoryRegion {
     pub access_violation_handler_payload: Option<u16>,
 }
 
+#[cfg_attr(
+    any(
+        not(feature = "jit"),
+        target_os = "windows",
+        not(target_arch = "x86_64")
+    ),
+    allow(dead_code)
+)]
 impl MemoryRegion {
-    /// Byte offset of the [HostBuffer] discriminant (0 immutable, 1 mutable)
+    /// Host tag is 0 for immutable and 1 for mutable, see `test_jit_layout` for the rest
     pub(crate) const JIT_HOST_TAG_OFFSET: i32 = 0;
-    /// Byte offset of the host pointer
     pub(crate) const JIT_HOST_PTR_OFFSET: i32 = 8;
-    /// Byte offset of the host length
     pub(crate) const JIT_HOST_LEN_OFFSET: i32 = 16;
-    /// Byte offset of `vm_addr`
     pub(crate) const JIT_VM_ADDR_OFFSET: i32 = 24;
-    /// Byte offset of `vm_gap_shift`
     pub(crate) const JIT_GAP_SHIFT_OFFSET: i32 = 32;
-    /// Size of a region in bytes
     pub(crate) const JIT_SIZE: usize = 40;
+}
 
+impl MemoryRegion {
     /// Create a VM memory region with host `address` pointing to a `len` bytes of data.
     ///
     /// This region will be made available in the guest at `vm_addr`.
@@ -723,28 +728,31 @@ impl AlignedMemoryMapping {
 /// (unaligned mapping, uninitialized mapping) the table is [JitRegionTable::DISABLED].
 #[repr(C)]
 #[derive(Debug)]
-pub struct JitRegionTable {
-    /// First region of the aligned mapping
-    pub regions: *const MemoryRegion,
-    /// Number of regions
-    pub len: u64,
+pub(crate) struct JitRegionTable {
+    regions: *const MemoryRegion,
+    len: u64,
     /// `virtual_address_bits` of the aligned mapping, `u64::MAX` when disabled
-    pub shift: u64,
+    shift: u64,
 }
 
+#[cfg_attr(
+    any(
+        not(feature = "jit"),
+        target_os = "windows",
+        not(target_arch = "x86_64")
+    ),
+    allow(dead_code)
+)]
 impl JitRegionTable {
     /// Table which makes the JIT fall back to [MemoryMapping::load_first_attempt]
-    pub const DISABLED: Self = Self {
+    pub(crate) const DISABLED: Self = Self {
         regions: ptr::null(),
         len: 0,
         shift: u64::MAX,
     };
-    /// Byte offset of `regions`
-    pub const REGIONS_OFFSET: i32 = 0;
-    /// Byte offset of `len`
-    pub const LEN_OFFSET: i32 = 8;
-    /// Byte offset of `shift`
-    pub const SHIFT_OFFSET: i32 = 16;
+    pub(crate) const REGIONS_OFFSET: i32 = 0;
+    pub(crate) const LEN_OFFSET: i32 = 8;
+    pub(crate) const SHIFT_OFFSET: i32 = 16;
 }
 
 /// Common parts of [UnalignedMemoryMapping] and [AlignedMemoryMapping]
@@ -1073,11 +1081,6 @@ impl MemoryMapping {
         result
     }
 
-    /// Region table used by the JIT for inline address translation
-    pub fn jit_region_table(&self) -> &JitRegionTable {
-        &self.jit_table
-    }
-
     #[cold]
     #[inline(never)]
     fn generate_access_violation_for(
@@ -1253,11 +1256,26 @@ mod test {
     fn test_jit_layout() {
         assert_eq!(mem::size_of::<MemoryRegion>(), MemoryRegion::JIT_SIZE);
         assert_eq!(mem::offset_of!(MemoryMapping, jit_table), 0);
-        assert_eq!(mem::offset_of!(JitRegionTable, regions), JitRegionTable::REGIONS_OFFSET as usize);
-        assert_eq!(mem::offset_of!(JitRegionTable, len), JitRegionTable::LEN_OFFSET as usize);
-        assert_eq!(mem::offset_of!(JitRegionTable, shift), JitRegionTable::SHIFT_OFFSET as usize);
-        assert_eq!(mem::offset_of!(MemoryRegion, vm_addr), MemoryRegion::JIT_VM_ADDR_OFFSET as usize);
-        assert_eq!(mem::offset_of!(MemoryRegion, vm_gap_shift), MemoryRegion::JIT_GAP_SHIFT_OFFSET as usize);
+        assert_eq!(
+            mem::offset_of!(JitRegionTable, regions),
+            JitRegionTable::REGIONS_OFFSET as usize
+        );
+        assert_eq!(
+            mem::offset_of!(JitRegionTable, len),
+            JitRegionTable::LEN_OFFSET as usize
+        );
+        assert_eq!(
+            mem::offset_of!(JitRegionTable, shift),
+            JitRegionTable::SHIFT_OFFSET as usize
+        );
+        assert_eq!(
+            mem::offset_of!(MemoryRegion, vm_addr),
+            MemoryRegion::JIT_VM_ADDR_OFFSET as usize
+        );
+        assert_eq!(
+            mem::offset_of!(MemoryRegion, vm_gap_shift),
+            MemoryRegion::JIT_GAP_SHIFT_OFFSET as usize
+        );
         let mut mem1 = [0u8; 16];
         let mem2 = [0u8; 8];
         let writable = MemoryRegion::new_gapped(&raw mut mem1, 2 * MM_REGION_SIZE, 4096);
@@ -1266,26 +1284,45 @@ mod test {
             let p = region as *const MemoryRegion as *const u64;
             [*p, *p.add(1), *p.add(2), *p.add(3)]
         };
-        assert_eq!(words(&writable), [1, mem1.as_ptr() as u64, 16, 2 * MM_REGION_SIZE]);
+        assert_eq!(
+            words(&writable),
+            [1, mem1.as_ptr() as u64, 16, 2 * MM_REGION_SIZE]
+        );
         assert_eq!(writable.vm_gap_shift, 12);
-        assert_eq!(words(&readonly), [0, mem2.as_ptr() as u64, 8, MM_REGION_SIZE]);
+        assert_eq!(
+            words(&readonly),
+            [0, mem2.as_ptr() as u64, 8, MM_REGION_SIZE]
+        );
         assert_eq!(readonly.vm_gap_shift, 63);
-        let config = Config { aligned_memory_mapping: true, ..Config::default() };
-        let mut m = unsafe {
-            MemoryMapping::new(vec![readonly.clone(), writable.clone()], &config, SBPFVersion::V3).unwrap()
+        let config = Config {
+            aligned_memory_mapping: true,
+            ..Config::default()
         };
-        let table = m.jit_region_table();
-        assert_eq!(table.shift, config.aligned_region_size.trailing_zeros() as u64);
-        assert_eq!(table.len, 3);
-        assert_eq!(table.regions, m.get_regions().as_ptr());
+        let mut m = unsafe {
+            MemoryMapping::new(
+                vec![readonly.clone(), writable.clone()],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            m.jit_table.shift,
+            config.aligned_region_size.trailing_zeros() as u64
+        );
+        assert_eq!(m.jit_table.len, 3);
+        assert_eq!(m.jit_table.regions, m.get_regions().as_ptr());
         m.get_regions_mut();
-        assert_eq!(m.jit_region_table().shift, u64::MAX);
-        let config = Config { aligned_memory_mapping: false, ..Config::default() };
+        assert_eq!(m.jit_table.shift, u64::MAX);
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
         let m = unsafe {
             MemoryMapping::new(vec![readonly, writable], &config, SBPFVersion::V3).unwrap()
         };
-        assert_eq!(m.jit_region_table().shift, u64::MAX);
-        assert_eq!(m.jit_region_table().len, 0);
+        assert_eq!(m.jit_table.shift, u64::MAX);
+        assert_eq!(m.jit_table.len, 0);
     }
 
     #[test]

@@ -157,6 +157,17 @@ const ANCHOR_TRANSLATE_FALLBACK: usize = 35;
 const ANCHOR_TRANSLATE_INLINE: usize = 47;
 const ANCHOR_COUNT: usize = 59; // Update me when adding or removing anchors
 
+/// (anchor base, access length) of every address translation anchor: loads, stores, immediate stores
+#[rustfmt::skip]
+const TRANSLATE_ANCHORS: [(usize, i32); 12] = [
+    (0, 1), (0, 2), (0, 4), (0, 8),
+    (4, 1), (4, 2), (4, 4), (4, 8),
+    (8, 1), (8, 2), (8, 4), (8, 8),
+];
+
+// The inline region stride is `lea rdx, [rdx + rdx*4]; shl rdx, 3`
+const _: () = assert!(MemoryRegion::JIT_SIZE == 40);
+
 /// Mapping of guest to host registers
 pub const REGISTER_MAP: [X86Register; 11] = [
     CALLER_SAVED_REGISTERS[0], // RAX
@@ -1604,11 +1615,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
         // Translates a vm memory address to a host memory address
         let lower_key = self.immediate_value_key as i32 as i64;
-        for (anchor_base, len) in &[
-            (0, 1i32), (0, 2i32), (0, 4i32), (0, 8i32),
-            (4, 1i32), (4, 2i32), (4, 4i32), (4, 8i32),
-            (8, 1i32), (8, 2i32), (8, 4i32), (8, 8i32),
-        ] {
+        for (anchor_base, len) in &TRANSLATE_ANCHORS {
             let target_offset = *anchor_base + len.trailing_zeros() as usize;
             self.set_anchor(ANCHOR_TRANSLATE_MEMORY_ADDRESS + target_offset);
             self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3B, REGISTER_INSTRUCTION_METER, RSP, Some(X86IndirectAccess::OffsetIndexShift(-8, RSP, 0)))); // cmp REGISTER_INSTRUCTION_METER, pc (on rsp);
@@ -1723,12 +1730,19 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
     }
 
+    /// Pops the registers saved by the inline translation and drops the caller's two slots
+    fn emit_inline_translation_epilogue(&mut self) {
+        self.emit_ins(X86Instruction::pop(RCX));
+        self.emit_ins(X86Instruction::pop(RDX));
+        self.emit_ins(X86Instruction::pop(RAX));
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 24, None)); // RSP += 24
+    }
+
     /// Translates vm addresses inline for initialized aligned memory mappings.
     ///
-    /// The call sites of `emit_address_translation` enter here with the same stack layout as
-    /// `ANCHOR_TRANSLATE_MEMORY_ADDRESS`. Every condition checked by
-    /// `MemoryMapping::load_first_attempt` / `store_first_attempt` is replicated; whenever one
-    /// does not hold the generic path is taken, so error reporting is unchanged.
+    /// Entered with the stack layout of `ANCHOR_TRANSLATE_MEMORY_ADDRESS`. Every condition of
+    /// `load_first_attempt` / `store_first_attempt` is replicated, and whenever one does not hold
+    /// the generic path is taken, so error reporting is unchanged.
     fn emit_inline_address_translation(&mut self) {
         let lower_key = self.immediate_value_key as i32 as i64;
         let virtual_address_bits = self.config.aligned_region_size.trailing_zeros() as i64;
@@ -1737,26 +1751,14 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         } else {
             63
         };
-        let anchors: [(usize, i32); 12] = [
-            (0, 1), (0, 2), (0, 4), (0, 8),
-            (4, 1), (4, 2), (4, 4), (4, 8),
-            (8, 1), (8, 2), (8, 4), (8, 8),
-        ];
-
-        // Fallback trampolines: undo the inline prologue and continue with the generic path
-        for (anchor_base, len) in anchors {
-            let target_offset = anchor_base + len.trailing_zeros() as usize;
-            self.set_anchor(ANCHOR_TRANSLATE_FALLBACK + target_offset);
-            self.emit_ins(X86Instruction::pop(RCX));
-            self.emit_ins(X86Instruction::pop(RDX));
-            self.emit_ins(X86Instruction::pop(RAX));
-            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 24, None)); // RSP += 24
-            self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_TRANSLATE_MEMORY_ADDRESS + target_offset, 5)));
-        }
-
-        for (anchor_base, len) in anchors {
+        for (anchor_base, len) in TRANSLATE_ANCHORS {
             let target_offset = anchor_base + len.trailing_zeros() as usize;
             let fallback = ANCHOR_TRANSLATE_FALLBACK + target_offset;
+            // Fallback trampoline: undo the inline prologue and continue with the generic path
+            self.set_anchor(fallback);
+            self.emit_inline_translation_epilogue();
+            self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_TRANSLATE_MEMORY_ADDRESS + target_offset, 5)));
+
             self.set_anchor(ANCHOR_TRANSLATE_INLINE + target_offset);
             self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3B, REGISTER_INSTRUCTION_METER, RSP, Some(X86IndirectAccess::OffsetIndexShift(-8, RSP, 0)))); // cmp REGISTER_INSTRUCTION_METER, pc (on rsp);
             self.emit_ins(X86Instruction::conditional_jump_immediate(0x86, self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 6)));
@@ -1823,10 +1825,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 }
                 self.emit_ins(X86Instruction::store(size, RCX, RDX, X86IndirectAccess::Offset(0)));
             }
-            self.emit_ins(X86Instruction::pop(RCX));
-            self.emit_ins(X86Instruction::pop(RDX));
-            self.emit_ins(X86Instruction::pop(RAX));
-            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 24, None)); // RSP += 24
+            self.emit_inline_translation_epilogue();
             self.emit_ins(X86Instruction::return_near());
         }
     }
