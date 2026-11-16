@@ -263,7 +263,7 @@ pub struct MemoryRegion {
     vm_gap_shift: u8,
     /// User defined payload for the [AccessViolationHandler]
     pub access_violation_handler_payload: Option<u16>,
-    dirty_prefix_len: Cell<u64>,
+    stores_end: Cell<u64>,
 }
 
 impl MemoryRegion {
@@ -283,26 +283,25 @@ impl MemoryRegion {
             vm_addr,
             vm_gap_shift,
             access_violation_handler_payload: None,
-            dirty_prefix_len: Cell::new(0),
+            stores_end: Cell::new(0),
         }
     }
 
-    /// Length of the host buffer prefix that stores may have modified.
+    /// Host offset one past the last byte any store through this region reached.
     ///
-    /// A host recycling the buffer only needs to zero this prefix.
-    pub fn dirty_prefix_len(&self) -> u64 {
-        self.dirty_prefix_len.get()
+    /// A host recycling the buffer only needs to zero up to here.
+    pub fn stores_end(&self) -> u64 {
+        self.stores_end.get()
     }
 
     #[inline(always)]
-    fn extend_dirty_prefix(&self, host_buffer: &HostBuffer, len: u64) {
+    fn extend_stores_end(&self, host_buffer: &HostBuffer, len: u64) {
         let offset = host_buffer
             .ptr()
             .addr()
             .wrapping_sub(self.host.ptr().addr()) as u64;
         let end = offset.saturating_add(len);
-        self.dirty_prefix_len
-            .set(self.dirty_prefix_len.get().max(end));
+        self.stores_end.set(self.stores_end.get().max(end));
     }
 
     /// Creates a new, empty `MemoryRegion`.
@@ -874,7 +873,7 @@ impl MemoryMapping {
                     .vm_to_host_buffer(vm_addr, len)
                     .inspect(|host_buffer| {
                         if access_type == AccessType::Store {
-                            region.extend_dirty_prefix(host_buffer, len);
+                            region.extend_stores_end(host_buffer, len);
                         }
                     })
             }
@@ -1115,7 +1114,7 @@ fn invoke_access_violation_handler_then_map<C: ContextObject>(
     if region.host_buffer().is_mutable() || access_type != AccessType::Store {
         if let Some(host_buffer) = region.vm_to_host_buffer(vm_addr, len) {
             if access_type == AccessType::Store {
-                region.extend_dirty_prefix(&host_buffer, len);
+                region.extend_stores_end(&host_buffer, len);
             }
             if let Err(err) = unsafe { memory_mapping.replace_region(region_index, region) } {
                 return StableResult::Err(err);
@@ -1218,7 +1217,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_dirty_prefix_len() {
+    fn test_stores_end() {
         let mut mem = [0u8; 3 * 4096];
         let readonly = [0u8; 64];
         let config = Config {
@@ -1236,20 +1235,20 @@ mod test {
             )
             .unwrap()
         };
-        let dirty_prefix_len = |region: usize| m.get_regions()[region].dirty_prefix_len();
+        let stores_end = |region: usize| m.get_regions()[region].stores_end();
         m.map(AccessType::Load, 2 * MM_REGION_SIZE + 100, 8)
             .unwrap();
-        assert_eq!(dirty_prefix_len(2), 0);
+        assert_eq!(stores_end(2), 0);
         m.map(AccessType::Store, 2 * MM_REGION_SIZE + 100, 8)
             .unwrap();
         m.map(AccessType::Store, 2 * MM_REGION_SIZE + 8, 4).unwrap();
-        assert_eq!(dirty_prefix_len(2), 108);
+        assert_eq!(stores_end(2), 108);
         // vm offset 2 * 4096 + 8 lands at host offset 4096 + 8 (one gap removed)
         m.map(AccessType::Store, 2 * MM_REGION_SIZE + 2 * 4096 + 8, 8)
             .unwrap();
-        assert_eq!(dirty_prefix_len(2), 4096 + 16);
+        assert_eq!(stores_end(2), 4096 + 16);
         assert!(m.map(AccessType::Store, MM_REGION_SIZE + 8, 8).is_err());
-        assert_eq!(dirty_prefix_len(1), 0);
+        assert_eq!(stores_end(1), 0);
     }
 
     #[test]
